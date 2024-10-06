@@ -10,7 +10,7 @@ from tinygrad.ops import resolve
 from tinygrad.device import Device
 from tinygrad.renderer import Renderer, TensorCore, Program
 from tinygrad.dtype import ImageDType, PtrDType
-from tinygrad.helpers import all_same, colored, ansilen, dedup, getenv, prod, round_up, all_int, to_function_name, diskcache_put
+from tinygrad.helpers import all_same, colored, ansilen, dedup, getenv, prod, round_up, all_int, to_function_name, diskcache_put, flatten
 from tinygrad.helpers import DEBUG, TC_OPT, USE_TC, AMX
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import Variable, sint
@@ -51,6 +51,62 @@ class TensorCoreOptions:
       if removed_axis < axes[tc_dim]: axes[tc_dim] -= 1
       elif removed_axis == axes[tc_dim]: axes_exist[tc_dim] = False
     self.axes, self.axes_exist = tuple(axes), tuple(axes_exist)
+
+class TensorCoreLayout:
+  def __init__(self, warp_size:int, inp:List[int]):
+    self._warp_size, self._inp = warp_size, inp
+  def _wmma_helper(self, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_elem, b_elem, c_map):
+    assert len(self._inp[0]) == NUM_A, f"A must have {NUM_A} elements per thread, it has {len(self._inp[0])}"
+    assert len(self._inp[1]) == NUM_B, f"B must have {NUM_B} elements per thread, it has {len(self._inp[1])}"
+    assert len(self._inp[2]) == NUM_C, f"C must have {NUM_C} elements per thread, it has {len(self._inp[2])}"
+    assert len(flatten(self._inp[0])) == NUM_A * self._warp_size, f"WMMA must have {NUM_A * self._warp_size} total elements for A in WMMA"
+    assert len(flatten(self._inp[1])) == NUM_B * self._warp_size, f"WMMA must have {NUM_B * self._warp_size} total elements for B in WMMA"
+    assert len(flatten(self._inp[2])) == NUM_C * self._warp_size, f"WMMA must have {NUM_C * self._warp_size} total elements for C in WMMA"
+    assert self._warp_size > 0 and self._warp_size % WARP_THREADS == 0, f"must have multiples of {WARP_THREADS} warp threads"
+    out = [self._inp[0][2][elem_idx][:] for elem_idx in range(NUM_C)]
+    for goff in range(0, self._warp_size, WARP_THREADS):
+      for lane_id in range(WARP_THREADS):
+        for elem_idx in range(NUM_C): # calculate new muls and add to acc
+          (c_i, c_j) = c_map(lane_id, elem_idx)
+          out[elem_idx][goff+lane_id] += sum(a_elem(self._inp[0][0], _k, c_j, goff) * b_elem(self._inp[0][1], c_i, _k, goff) for _k in range(K))
+    return out
+  def wmma_model(self, arch:str):
+    if arch == "METAL":
+      # A (2 elements on 32 threads): row major
+      def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
+      # (i, j), C, D (2 elements on 32 threads): row major same as A/B
+      def c_map(lane, elem): return (elem + ((lane%2)*2) + ((lane//8)%2)*4, ((lane//2)%4) + (lane//16)*4)
+      return self._wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
+    elif arch == "AMD":
+      # A (16 elements on 32 threads): col major, lane 16-32 == lane 0-15
+      def a_elem(x, i, j, goff):
+        assert x[i][goff+j] == x[i][goff+j+16], "warp elements not duplicated properly across lanes"
+        return x[i][goff+j]
+      # B (16 elements on 32 threads): row major, lane 16-32 == lane 0-15
+      def b_elem(x, i, j, goff): return a_elem(x, j, i, goff)  # pylint: disable=arguments-out-of-order
+      def c_map(lane, elem): return (lane%16, lane//16+elem*2) # (i, j), C, D (8 elements on 32 threads): row major
+      return self._wmma_helper(32, 16, 16, 16, 8, a_elem, b_elem, c_map)
+    elif arch == "CUDA":
+      # A (8 elements on 32 threads)
+      def a_elem(x, i, j, goff): return x[(i%2)+(j//8)*2+(i//8)*4][goff+((i//2)%4)+(j%8)*4]
+      # B (4 elements on 32 threads)
+      def b_elem(x, i, j, goff): return x[(j%2)+(j//8)*2][goff+(j//2)%4+(i)*4]
+      # (i, j), C, D (4 elements on 32 threads)
+      def c_map(lane, elem): return ((elem%2)+(lane%4)*2, (lane//4)+(elem//2)*8)
+      return self._wmma_helper(32, 16, 8, 4, 4, a_elem, b_elem, c_map)
+    elif arch == "INTEL":
+      # A (16 elements on 8 threads)
+      def a_elem(x, i, j, goff): return x[i%2+j*2][goff+i//2]
+      # B (16 elements on 8 threads)
+      def b_elem(x, i, j, goff): return x[j][goff+i]
+      # C, D (8 elements on 8 threads)
+      def c_map(lane, elem): return (lane, elem)
+      return self._wmma_helper(8, 16, 16, 16, 8, a_elem, b_elem, c_map)
+    elif arch == "CLANG":
+      def elem(x, i, j, _): return x[i+j][0]
+      def c_map(_, elem): return (elem%16, elem//16)
+      return self._wmma_helper(1, 1, 16, 16, 256, elem, elem, c_map)
+    else: raise NotImplementedError(f"unimplemented tensor core for {arch}")
 
 class Kernel:
   def __init__(self, ast:UOp, opts:Optional[Renderer]=None):
