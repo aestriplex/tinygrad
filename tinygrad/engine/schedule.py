@@ -33,8 +33,11 @@ def found_contiguous(ctx:dict[UOp, UOp], contig:UOp, src:UOp):
 def replace_contiguous(ctx:dict[UOp, UOp], alu:UOp):
   new_src = list(alu.src)
   for i,s in enumerate(alu.src):
-    if (replace_src:=ctx.get(s, None)) is not None: new_src[i] = replace_src
-  if tuple(new_src) != alu.src: return alu.replace(src=tuple(new_src))
+    if (replace_src:=ctx.get(s, None)) is not None:
+      new_src[i] = replace_src
+  if tuple(new_src) != alu.src:
+    raise Exception()
+    return alu.replace(src=tuple(new_src))
 
 sym = symbolic_simple+PatternMatcher([
   # UOp with size 0 is zero
